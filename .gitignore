@@ -9,3 +9,5 @@ dist/
 build/
 uv.lock
 
+PUBLISH.md
+

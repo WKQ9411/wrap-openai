@@ -7,6 +7,7 @@ from typing import Callable, AsyncGenerator, Generator, Any, Optional, Union
 from fastapi import FastAPI, HTTPException, Depends, Header, Security
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 from .api_keys import get_api_key_manager
@@ -26,8 +27,16 @@ from .models import (
 app = FastAPI(
     title="Wrap OpenAI API",
     description="Wrap any custom generate function as an OpenAI SDK compatible API service",
-    version="0.1.0",
+    version="0.2.0",
 )
+
+# CORS configuration
+_cors_enabled = False
+_cors_origins = ["*"]
+_cors_allow_credentials = False
+_cors_allow_methods = ["*"]
+_cors_allow_headers = ["*"]
+_cors_middleware_added = False
 
 # API Key authentication
 security = HTTPBearer(auto_error=False)
@@ -87,6 +96,57 @@ def set_api_key_required(required: bool):
     """Set whether API Key verification is required"""
     global _api_key_required
     _api_key_required = required
+
+
+def set_cors(
+    enabled: bool = True,
+    origins: Union[list[str], str] = "*",
+    allow_credentials: bool = False,
+    allow_methods: Union[list[str], str] = "*",
+    allow_headers: Union[list[str], str] = "*",
+):
+    """
+    Configure CORS settings
+    
+    Args:
+        enabled: Whether to enable CORS (default: True)
+        origins: List of allowed origins or "*" for all origins (default: "*")
+        allow_credentials: Whether to allow credentials (default: False)
+        allow_methods: Allowed HTTP methods or "*" for all methods (default: "*")
+        allow_headers: Allowed headers or "*" for all headers (default: "*")
+    """
+    global _cors_enabled, _cors_origins, _cors_allow_credentials, _cors_allow_methods, _cors_allow_headers, _cors_middleware_added
+    
+    _cors_enabled = enabled
+    
+    # Convert string to list if needed
+    if isinstance(origins, str):
+        _cors_origins = [origins] if origins != "*" else ["*"]
+    else:
+        _cors_origins = origins
+    
+    _cors_allow_credentials = allow_credentials
+    
+    if isinstance(allow_methods, str):
+        _cors_allow_methods = [allow_methods] if allow_methods != "*" else ["*"]
+    else:
+        _cors_allow_methods = allow_methods
+    
+    if isinstance(allow_headers, str):
+        _cors_allow_headers = [allow_headers] if allow_headers != "*" else ["*"]
+    else:
+        _cors_allow_headers = allow_headers
+    
+    # Apply CORS middleware to app (only add once)
+    if _cors_enabled and not _cors_middleware_added:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=_cors_origins if _cors_origins != ["*"] else ["*"],
+            allow_credentials=_cors_allow_credentials,
+            allow_methods=_cors_allow_methods if _cors_allow_methods != ["*"] else ["*"],
+            allow_headers=_cors_allow_headers if _cors_allow_headers != ["*"] else ["*"],
+        )
+        _cors_middleware_added = True
 
 
 async def verify_api_key(
@@ -736,7 +796,7 @@ async def root():
     """Root endpoint"""
     return {
         "message": "Wrap OpenAI API Service",
-        "version": "0.1.0",
+        "version": "0.2.0",
         "endpoints": {
             "chat_completions": "/v1/chat/completions",
             "health": "/health",
@@ -836,7 +896,17 @@ async def revoke_api_key(api_key: str):
         )
 
 
-def run_server(host: str = "0.0.0.0", port: int = 8000, require_api_key: bool = False, allow_remote_api_key_management: bool = True):
+def run_server(
+    host: str = "0.0.0.0",
+    port: int = 8000,
+    require_api_key: bool = False,
+    allow_remote_api_key_management: bool = True,
+    enable_cors: bool = True,
+    cors_origins: Union[list[str], str] = "*",
+    cors_allow_credentials: bool = False,
+    cors_allow_methods: Union[list[str], str] = "*",
+    cors_allow_headers: Union[list[str], str] = "*",
+):
     """
     Run server
     
@@ -846,6 +916,11 @@ def run_server(host: str = "0.0.0.0", port: int = 8000, require_api_key: bool = 
         require_api_key: Whether API Key verification is required
         allow_remote_api_key_management: Whether to allow API Key management (generate/list/revoke) via HTTP API.
                                         If False, API Key management can only be done on the server side.
+        enable_cors: Whether to enable CORS (default: True)
+        cors_origins: List of allowed origins or "*" for all origins (default: "*")
+        cors_allow_credentials: Whether to allow credentials in CORS (default: False)
+        cors_allow_methods: Allowed HTTP methods or "*" for all methods (default: "*")
+        cors_allow_headers: Allowed headers or "*" for all headers (default: "*")
     """
     if require_api_key:
         set_api_key_required(True)
@@ -858,6 +933,19 @@ def run_server(host: str = "0.0.0.0", port: int = 8000, require_api_key: bool = 
         print("✅  Remote API Key management enabled")
     else:
         print("🔒  Remote API Key management disabled (API Keys can only be managed on server side)")
+    
+    # Configure CORS
+    if enable_cors:
+        set_cors(
+            enabled=True,
+            origins=cors_origins,
+            allow_credentials=cors_allow_credentials,
+            allow_methods=cors_allow_methods,
+            allow_headers=cors_allow_headers,
+        )
+        print("✅  CORS enabled")
+    else:
+        print("⚠️  CORS disabled")
     
     uvicorn.run(app, host=host, port=port)
 

@@ -4,6 +4,7 @@ from wrap_openai.app import (
     run_server,
     set_api_key_required,
     set_allow_remote_api_key_management,
+    set_cors,
 )
 
 from wrap_openai.api_keys import (
@@ -27,7 +28,7 @@ from wrap_openai.models import (
     ChatCompletionChunkDelta,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = [
     # main interface
     "app",
@@ -35,6 +36,7 @@ __all__ = [
     "run_server",
     "set_api_key_required",
     "set_allow_remote_api_key_management",
+    "set_cors",
     # API Key management
     "APIKeyManager",
     "get_api_key_manager",

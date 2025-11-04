@@ -11,6 +11,7 @@ Wrap custom generate function as an OpenAI SDK compatible API service.
 - **Async Support**: Support OpenAI SDK's async client
 - **Dynamic Parameters**: Support dynamic passing of common parameters (temperature, max_tokens, etc.)
 - **API Key Management**: Built-in API Key authentication and management
+- **CORS Support**: Built-in CORS middleware for cross-origin requests
 
 ## 2. Installation
 
@@ -40,7 +41,7 @@ uv sync --extra qwen
 
 #### Custom Generate Function
 
-The first parameter of the generate function should be `prompt: str` or `messages: List[Dict]`. The return type should be `str` if the function does not support streaming, or `Generator[str, None, None]` if the function supports streaming. 
+The first parameter of the generate function should be `prompt: str` or `messages: List[Dict]`. The return type should be `str` if the function does not support streaming, or `Generator[str, None, None]` if the function supports streaming.
 
 You can also pass additional parameters to the function, which will be used as server defaults and can be overridden by OpenAI client requests.
 
@@ -136,10 +137,10 @@ register_funcs(
 
 #### Server Configuration
 
-You can require API Key verification and remote API Key management via HTTP API.
+You can require API Key verification and remote API Key management via HTTP API. CORS is enabled by default to allow cross-origin requests.
 
 ```python
-from wrap_openai import run_server, set_api_keys_path
+from wrap_openai import run_server, set_api_keys_path, set_cors
 
 # Configure API Keys storage path (optional, default: .api_keys/keys.json)
 set_api_keys_path("/custom/path/to/keys")  # Directory or file path
@@ -149,9 +150,36 @@ run_server(
     host="0.0.0.0",                       # Server bind address (default: "0.0.0.0")
     port=8000,                            # Server port (default: 8000)
     require_api_key=False,                # Enable API Key verification (default: False)
-    allow_remote_api_key_management=True  # Allow remote API Key management via HTTP API (default: True)
+    allow_remote_api_key_management=True, # Allow remote API Key management via HTTP API (default: True)
+    enable_cors=True,                    # Enable CORS (default: True)
+    cors_origins="*",                    # Allowed origins: "*" for all, or list of specific origins (default: "*")
+    cors_allow_credentials=False,        # Allow credentials in CORS requests (default: False)
+    cors_allow_methods="*",              # Allowed HTTP methods (default: "*")
+    cors_allow_headers="*"               # Allowed headers (default: "*")
 )
 ```
+
+**CORS Configuration Options:**
+
+You can also configure CORS separately using the `set_cors` function:
+
+```python
+from wrap_openai import set_cors, run_server
+
+# Configure CORS with specific origins
+set_cors(
+    enabled=True,
+    origins=["http://localhost:3000", "https://example.com"],  # Specific origins
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"]
+)
+
+# Start server
+run_server(host="0.0.0.0", port=8000)
+```
+
+**Note**: By default, CORS is enabled with `origins="*"` to allow all origins, which is convenient for development and testing.
 
 ### (2) API Key Management
 
