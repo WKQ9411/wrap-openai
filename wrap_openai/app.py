@@ -27,7 +27,7 @@ from .models import (
 app = FastAPI(
     title="Wrap OpenAI API",
     description="Wrap any custom generate function as an OpenAI SDK compatible API service",
-    version="0.2.0",
+    version="0.2.1",
 )
 
 # CORS configuration
@@ -796,7 +796,7 @@ async def root():
     """Root endpoint"""
     return {
         "message": "Wrap OpenAI API Service",
-        "version": "0.2.0",
+        "version": "0.2.1",
         "endpoints": {
             "chat_completions": "/v1/chat/completions",
             "health": "/health",

@@ -28,7 +28,7 @@ from wrap_openai.models import (
     ChatCompletionChunkDelta,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 __all__ = [
     # main interface
     "app",
