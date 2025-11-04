@@ -947,5 +947,16 @@ def run_server(
     else:
         print("⚠️  CORS disabled")
     
+    # Check streaming support
+    has_generate = _registered_funcs['generate']['func'] is not None
+    has_stream = _registered_funcs['stream']['func'] is not None
+    
+    if has_stream:
+        print("✅  Streaming mode supported")
+    elif has_generate:
+        print("⚠️  Streaming mode not supported (only non-streaming mode available)")
+    else:
+        print("❌  No generate function registered!")
+    
     uvicorn.run(app, host=host, port=port)
 
