@@ -213,7 +213,7 @@ python demo/manage_api_keys.py list --base-url http://localhost:8000
 python demo/manage_api_keys.py revoke <api_key> --base-url http://localhost:8000
 ```
 
-If the `allow_remote_api_key_management` is ser to `False`, the API Key management can only be done on the server side.
+If the `allow_remote_api_key_management` is set to `False`, the API Key management can only be done on the server side.
 
 #### Using Python Code
 
