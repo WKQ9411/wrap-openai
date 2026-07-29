@@ -99,6 +99,41 @@ register_funcs(my_stream_generate, support_stream=True)
 run_server(host="0.0.0.0", port=8000)
 ```
 
+**Note**: You cannot have both `yield` and `return` statements in the same function, because if a function contains `yield`, it becomes a generator function so that wrap-openai cannot determine the return type, even if you have a `return` statement.
+
+If you need a unified function that supports both streaming and non-streaming modes, you should wrap different functions (one returns `str`, another returns `Generator`) into a unified interface. See `demo/run_server.py` for an example implementation of `unified_generate` function:
+
+```python
+from typing import List, Dict, Union, Generator
+from wrap_openai import register_funcs
+
+# Separate functions for streaming and non-streaming
+def messages_generate(messages: List[Dict], temperature: float = 0.7) -> str:
+    """Non-streaming: returns str"""
+    return f"Response: {messages}"
+
+def messages_stream_generate(messages: List[Dict], temperature: float = 0.7):
+    """Streaming: returns Generator"""
+    response = f"Response: {messages}"
+    for char in response:
+        yield char
+
+# Unified function that wraps the above functions
+def unified_generate(
+    messages: List[Dict],
+    stream: bool = False,
+    temperature: float = 0.7
+) -> Union[str, Generator[str, None, None]]:
+    """Unified interface: returns str or Generator based on stream parameter"""
+    if stream:
+        return messages_stream_generate(messages, temperature)  # Returns Generator
+    else:
+        return messages_generate(messages, temperature)  # Returns str
+
+# Register the unified function
+register_funcs(unified_generate, support_stream=True)
+```
+
 #### With Additional Parameters
 
 You can pass additional parameters to the generate function, which will be used as server defaults and can be overridden by OpenAI client requests.
