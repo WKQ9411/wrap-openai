@@ -5,8 +5,9 @@ class ChatDemo:
     """Simple CLI Chat Application"""
     
     def __init__(self, base_url: str = "http://localhost:8000/v1", 
-                 api_key: str = "sk-dummy", stream: bool = True):
+                 api_key: str = "sk-dummy", model_id: str = "echo-model", stream: bool = True):
         self.client = OpenAI(base_url=base_url, api_key=api_key)
+        self.model_id = model_id
         self.messages = []
         self.stream = stream
     
@@ -16,7 +17,7 @@ class ChatDemo:
         
         try:
             response = self.client.chat.completions.create(
-                model="custom-model",  # Model name doesn't matter for custom server
+                model=self.model_id,
                 messages=self.messages,
                 stream=self.stream
             )
@@ -84,6 +85,8 @@ if __name__ == "__main__":
                        help="API service URL")
     parser.add_argument("--api-key", type=str, default="sk-dummy",
                        help="API Key (use 'sk-dummy' if API Key verification is disabled)")
+    parser.add_argument("--model-id", type=str, default="echo-model",
+                       help="Registered model ID")
     parser.add_argument("--no-stream", action="store_true",
                        help="Disable streaming mode")
     
@@ -92,6 +95,7 @@ if __name__ == "__main__":
     demo = ChatDemo(
         base_url=args.base_url,
         api_key=args.api_key,
+        model_id=args.model_id,
         stream=not args.no_stream
     )
     

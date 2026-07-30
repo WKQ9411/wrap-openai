@@ -1,321 +1,280 @@
 # Wrap OpenAI
 
-Wrap custom generate function as an OpenAI SDK compatible API service.
+Wrap a research-oriented custom generate function as an OpenAI Chat Completions compatible API service.
 
-> **Experimental Package**: This package is intended for experimental purposes and may not be suitable for production deployment.
+> **Experimental Package**: This package is designed for model research and prototype validation, not production inference serving.
 
 ## 1. Features
 
-- **OpenAI Compatible API**: Compatible with OpenAI Chat Completions API format
-- **Streaming & Non-streaming**: Support both generation modes with smart mode selection
-- **Async Support**: Support OpenAI SDK's async client
-- **Dynamic Parameters**: Support dynamic passing of common parameters (temperature, max_tokens, etc.)
-- **API Key Management**: Built-in API Key authentication and management
-- **CORS Support**: Built-in CORS middleware for cross-origin requests
+- OpenAI Chat Completions request and response format
+- Streaming and non-streaming generation
+- Raw `messages` input, including structured multimodal content
+- Explicit fixed, OpenAI, and custom parameter groups
+- Custom client parameters through OpenAI SDK `extra_body`
+- API Key management, CORS, and health check endpoints
 
 ## 2. Installation
 
 ```bash
-# pip
 pip install wrap-openai
-# uv
-uv pip install wrap-openai
 ```
 
-Or install from source:
+Install from source:
 
 ```bash
 git clone https://github.com/WKQ9411/wrap-openai.git
 cd wrap-openai
-# pip
-pip install -e .
-# uv
 uv sync
-# if you want to use the demo
+```
+
+Install the Qwen demo dependencies:
+
+```bash
 uv sync --extra qwen
 ```
 
-## 3. Quick Start
+## 3. Generate Function Contract
 
-### (1) Deploy Service
-
-#### Custom Generate Function
-
-The first parameter of the generate function should be `prompt: str` or `messages: List[Dict]`. The return type should be `str` if the function does not support streaming, or `Generator[str, None, None]` if the function supports streaming.
-
-You can also pass additional parameters to the function, which will be used as server defaults and can be overridden by OpenAI client requests.
-
-If your generate function supports multimodal content, you can use `messages: List[Dict]` as the first parameter. The content of the message can be a string or a list with type field, for example:
+The registered generate function must accept the OpenAI `messages` list as its first positional argument. The parameter name is not enforced, although `messages` is recommended.
 
 ```python
-# Simple text messages
-messages = [
-    {
-        "role": "user",
-        "content": "Hello"
-    }
-]
+def generate(messages, model, tokenizer, temperature=0.7):
+    ...
+```
 
-# Multimodal messages
+The messages structure is preserved:
+
+```python
 messages = [
+    {"role": "system", "content": "You are a helpful assistant."},
     {
         "role": "user",
         "content": [
-            {"type": "text", "text": "Hello"},
-            {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}
-        ]
-    }
+            {"type": "text", "text": "What is this?"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}},
+        ],
+    },
 ]
 ```
 
-You should parse the messages in your own generate function.
-
-#### Basic Usage
-
-You can simply use the `register_funcs` function to register your functions and use the `run_server` function to start the server.
+The generate function is responsible for applying the model-specific chat template:
 
 ```python
-from wrap_openai import register_funcs, run_server
-
-# step 1: define your generate function
-# Non-streaming function
-# the first parameter is prompt: str or messages: List[Dict], the return type is str
-def my_generate(prompt: str) -> str:
-    return f"Response to '{prompt}'"
-
-# Streaming function
-# the first parameter is prompt: str or messages: List[Dict], the return type is Generator[str, None, None]
-def my_stream_generate(prompt: str):
-    response = f"Streaming response to '{prompt}'"
-    for char in response:
-        yield char
-
-# step 2: register your functions
-# Register functions
-register_funcs(my_generate, support_stream=False)
-register_funcs(my_stream_generate, support_stream=True)
-
-# step 3: start the server
-run_server(host="0.0.0.0", port=8000)
+prompt = tokenizer.apply_chat_template(
+    messages,
+    tokenize=False,
+    add_generation_prompt=True,
+)
 ```
 
-**Note**: You cannot have both `yield` and `return` statements in the same function, because if a function contains `yield`, it becomes a generator function so that wrap-openai cannot determine the return type, even if you have a `return` statement.
+Return a string when `support_stream=False`, or yield string chunks when `support_stream=True`.
 
-If you need a unified function that supports both streaming and non-streaming modes, you should wrap different functions (one returns `str`, another returns `Generator`) into a unified interface. See `demo/run_server.py` for an example implementation of `unified_generate` function:
-
-```python
-from typing import List, Dict, Union, Generator
-from wrap_openai import register_funcs
-
-# Separate functions for streaming and non-streaming
-def messages_generate(messages: List[Dict], temperature: float = 0.7) -> str:
-    """Non-streaming: returns str"""
-    return f"Response: {messages}"
-
-def messages_stream_generate(messages: List[Dict], temperature: float = 0.7):
-    """Streaming: returns Generator"""
-    response = f"Response: {messages}"
-    for char in response:
-        yield char
-
-# Unified function that wraps the above functions
-def unified_generate(
-    messages: List[Dict],
-    stream: bool = False,
-    temperature: float = 0.7
-) -> Union[str, Generator[str, None, None]]:
-    """Unified interface: returns str or Generator based on stream parameter"""
-    if stream:
-        return messages_stream_generate(messages, temperature)  # Returns Generator
-    else:
-        return messages_generate(messages, temperature)  # Returns str
-
-# Register the unified function
-register_funcs(unified_generate, support_stream=True)
-```
-
-#### With Additional Parameters
-
-You can pass additional parameters to the generate function, which will be used as server defaults and can be overridden by OpenAI client requests.
-
-These parameters can be passed as server defaults and overridden by client requests:
-
-- `temperature` - Controls randomness
-- `max_tokens` - Maximum tokens to generate
-- `max_new_tokens` - Mapped to `max_tokens` (HuggingFace compatibility)
-- `top_p` - Nucleus sampling
-- `top_k` - Extended support
-- `presence_penalty` - Encourages new topics
-- `frequency_penalty` - Reduces repetition
-- `n` - Number of completion choices
-- `stop` - Stop sequences
-- `seed` - Random seed for reproducibility
+## 4. Register a Generate Function
 
 ```python
-def my_generate(prompt: str, model, tokenizer, temperature=0.7, max_tokens=512) -> str:
-    # Your generation logic
-    input_ids = tokenizer.encode(prompt)
-    output_ids = model.generate(input_ids, temperature, max_tokens)
-    output = tokenizer.decode(output_ids)
-    return output
+from wrap_openai import register_generate, run_server
 
-# Register with parameters
-register_funcs(
-    my_generate,
+
+def generate(
+    messages,
+    model,
+    tokenizer,
+    temperature=0.7,
+    max_tokens=512,
+    top_p=0.9,
+    top_k=50,
+    draft_steps=4,
+):
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    outputs = model.generate(
+        **inputs,
+        temperature=temperature,
+        max_new_tokens=max_tokens,
+        top_p=top_p,
+        top_k=top_k,
+        draft_steps=draft_steps,
+    )
+    return tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+
+register_generate(
+    generate_func=generate,
     support_stream=False,
-    model=model,              # Fixed parameter (bound permanently)
-    tokenizer=tokenizer,      # Fixed parameter (bound permanently)
-    temperature=0.8,          # Dynamic parameter (server default, can be overridden by client)
-    max_new_tokens=1024       # Dynamic parameter (server default, can be overridden by client)
-)
-```
-
-#### Server Configuration
-
-You can require API Key verification and remote API Key management via HTTP API. CORS is enabled by default to allow cross-origin requests.
-
-```python
-from wrap_openai import run_server, set_api_keys_path, set_cors
-
-# Configure API Keys storage path (optional, default: .api_keys/keys.json)
-set_api_keys_path("/custom/path/to/keys")  # Directory or file path
-
-# Start server with options
-run_server(
-    host="0.0.0.0",                       # Server bind address (default: "0.0.0.0")
-    port=8000,                            # Server port (default: 8000)
-    require_api_key=False,                # Enable API Key verification (default: False)
-    allow_remote_api_key_management=True, # Allow remote API Key management via HTTP API (default: True)
-    enable_cors=True,                    # Enable CORS (default: True)
-    cors_origins="*",                    # Allowed origins: "*" for all, or list of specific origins (default: "*")
-    cors_allow_credentials=False,        # Allow credentials in CORS requests (default: False)
-    cors_allow_methods="*",              # Allowed HTTP methods (default: "*")
-    cors_allow_headers="*"               # Allowed headers (default: "*")
-)
-```
-
-**CORS Configuration Options:**
-
-You can also configure CORS separately using the `set_cors` function:
-
-```python
-from wrap_openai import set_cors, run_server
-
-# Configure CORS with specific origins
-set_cors(
-    enabled=True,
-    origins=["http://localhost:3000", "https://example.com"],  # Specific origins
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"]
+    model_id="research-model-v1",
+    fixed_kwargs={
+        "model": model,
+        "tokenizer": tokenizer,
+    },
+    openai_kwargs={
+        "temperature": 0.7,
+        "max_tokens": 512,
+        "top_p": 0.9,
+    },
+    custom_kwargs={
+        "top_k": 50,
+        "draft_steps": 4,
+    },
 )
 
-# Start server
 run_server(host="0.0.0.0", port=8000)
 ```
 
-**Note**: By default, CORS is enabled with `origins="*"` to allow all origins, which is convenient for development and testing.
+`register_generate` accepts three flat keyword dictionaries:
 
-### (2) API Key Management
+- `fixed_kwargs`: server-only objects and values. Clients cannot override them.
+- `openai_kwargs`: enabled OpenAI parameters and server defaults. Standard request fields override them.
+- `custom_kwargs`: custom parameters and server defaults. `extra_body` fields override them.
 
-#### Using CLI Tool
-
-CLI tool is provided for API Key management. You can use the `wrap-openai` command to generate, list and revoke API Keys. This command can be used on the server side to manage API Keys.
-
-```bash
-# Generate API Key
-wrap-openai --generate [--name "my-key"] [--api-keys-path /path/to/keys]
-
-# List all API Keys
-wrap-openai --list [--api-keys-path /path/to/keys]
-
-# Revoke API Key
-wrap-openai --revoke <api_key> [--api-keys-path /path/to/keys]
-```
-
-#### Using HTTP API
-
-You can use the HTTP API to manage API Keys on the client side. The API endpoints are:
-
-```bash
-# Generate API Key
-python demo/manage_api_keys.py generate [--name "my-key"] --base-url http://localhost:8000
-
-# List all API Keys
-python demo/manage_api_keys.py list --base-url http://localhost:8000
-
-# Revoke API Key
-python demo/manage_api_keys.py revoke <api_key> --base-url http://localhost:8000
-```
-
-If the `allow_remote_api_key_management` is set to `False`, the API Key management can only be done on the server side.
-
-#### Using Python Code
+All three dictionaries are flattened when calling the function:
 
 ```python
-from wrap_openai import get_api_key_manager
-
-api_key_manager = get_api_key_manager()
-api_key = api_key_manager.generate_key(name="my-key")
-print(f"Generated API Key: {api_key}")
+generate_func(
+    messages,
+    **fixed_kwargs,
+    **effective_openai_kwargs,
+    **effective_custom_kwargs,
+)
 ```
 
-### (3) Use OpenAI SDK
+The following OpenAI parameters can be enabled through `openai_kwargs`:
+
+- `temperature`
+- `max_tokens`
+- `top_p`
+- `presence_penalty`
+- `frequency_penalty`
+- `n`
+- `stop`
+- `seed`
+
+Non-OpenAI parameters such as `top_k` and experimental decoding controls belong in `custom_kwargs`.
+
+Registration validates that:
+
+- the function accepts messages as its first positional argument;
+- registered keyword names are accepted by the function or `**kwargs`;
+- the three keyword groups do not overlap;
+- OpenAI parameters are placed in `openai_kwargs`;
+- reserved fields are not exposed as custom parameters.
+
+## 5. OpenAI SDK Client
 
 ```python
 from openai import OpenAI
 
+
 client = OpenAI(
     base_url="http://localhost:8000/v1",
-    api_key="sk-dummy"  # Required if API Key verification is enabled
+    api_key="sk-dummy",
 )
 
-# Non-streaming
 response = client.chat.completions.create(
-    model="custom-model",
+    model="research-model-v1",
     messages=[{"role": "user", "content": "Hello"}],
-    temperature=0.7,      # Override server default
-    max_tokens=512        # Override server default
+    temperature=0.2,
+    max_tokens=256,
+    extra_body={
+        "top_k": 20,
+        "draft_steps": 8,
+    },
 )
-print(response.choices[0].message.content)
 
-# Streaming
-stream = client.chat.completions.create(
-    model="custom-model",
-    messages=[{"role": "user", "content": "Hello"}],
-    stream=True
-)
-for chunk in stream:
-    if chunk.choices[0].delta.content:
-        print(chunk.choices[0].delta.content, end="")
+print(response.choices[0].message.content)
 ```
 
-## 4. Examples
+`extra_body` values are merged into the JSON request body by the OpenAI SDK. Only fields declared in `custom_kwargs` are accepted. Unknown custom fields and attempts to override fixed values return HTTP 422.
 
-See the `demo/` directory for complete examples:
+The request `model` must match the `model_id` passed to `register_generate`.
 
-- **`demo/run_server.py`** - Simple echo server with all features
-- **`demo/server_demo.py`** - Qwen2.5-0.5B model deployment example
-- **`demo/chat_demo.py`** - Simple CLI chat application
-- **`demo/manage_api_keys.py`** - API Key management via HTTP API
-- **`demo/run_client.py`** - Client usage examples
+## 6. Streaming
 
-## 5. Parameter Handling
+A streaming generate function yields string chunks:
 
-### (1) Fixed vs Dynamic Parameters
+```python
+def stream_generate(messages, model, tokenizer, temperature=0.7):
+    for text_chunk in custom_model_stream(messages, model, tokenizer, temperature):
+        yield text_chunk
 
-When registering functions with `**kwargs`:
 
-- **Fixed Parameters** (e.g., `model`, `tokenizer`): Bound permanently using `functools.partial`, cannot be overridden by client
-- **Dynamic Parameters** (e.g., `temperature`, `max_tokens`): Server defaults, can be overridden by client requests
+register_generate(
+    generate_func=stream_generate,
+    support_stream=True,
+    model_id="research-model-v1",
+    fixed_kwargs={
+        "model": model,
+        "tokenizer": tokenizer,
+    },
+    openai_kwargs={
+        "temperature": 0.7,
+    },
+)
+```
 
-### (2) Stream Parameter
+When the client requests `stream=False`, wrap-openai collects the chunks into one response. When a non-streaming function receives a `stream=True` request, the complete result is returned in one SSE chunk with a warning chunk.
 
-The `stream` parameter has special handling:
+Client example:
 
-- If `support_stream=True`: Function supports both modes, client's `stream` parameter is respected
-- If `support_stream=False`: Only non-streaming mode, client's `stream` parameter is ignored
+```python
+stream = client.chat.completions.create(
+    model="research-model-v1",
+    messages=[{"role": "user", "content": "Hello"}],
+    stream=True,
+)
 
-## 6. License
+for chunk in stream:
+    content = chunk.choices[0].delta.content
+    if content:
+        print(content, end="", flush=True)
+```
+
+## 7. Server Configuration
+
+```python
+run_server(
+    host="0.0.0.0",
+    port=8000,
+    require_api_key=False,
+    allow_remote_api_key_management=False,
+    enable_cors=True,
+    cors_origins="*",
+)
+```
+
+Health check:
+
+```text
+GET /health
+```
+
+## 8. API Key Management
+
+```bash
+wrap-openai --generate --name "my-key"
+wrap-openai --list
+wrap-openai --revoke <api_key>
+```
+
+Configure the storage path from Python:
+
+```python
+from wrap_openai import set_api_keys_path
+
+set_api_keys_path("/custom/path/to/keys")
+```
+
+## 9. Examples
+
+- `demo/run_server.py`: lightweight messages, streaming, and custom parameter example
+- `demo/server_demo.py`: Qwen model deployment example
+- `demo/run_client.py`: OpenAI SDK client examples
+- `demo/chat_demo.py`: CLI chat application
+- `demo/manage_api_keys.py`: API Key management over HTTP
+
+## 10. License
 
 MIT License

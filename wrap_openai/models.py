@@ -1,5 +1,5 @@
 from typing import List, Optional, Literal, Union
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class TextContent(BaseModel):
@@ -46,12 +46,13 @@ class Message(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    model: Optional[str] = Field(default="custom-model", description="Model name (optional, defaults to 'custom-model')")
+    model_config = ConfigDict(extra="allow")
+
+    model: str = Field(..., description="Registered model identifier")
     messages: List[Message] = Field(..., description="List of conversation messages")
     temperature: Optional[float] = Field(default=1.0, ge=0, le=2, description="Temperature parameter, controls randomness")
     max_tokens: Optional[int] = Field(default=None, ge=1, description="Maximum number of tokens to generate")
     top_p: Optional[float] = Field(default=None, ge=0, le=1, description="Nucleus sampling parameter")
-    top_k: Optional[int] = Field(default=None, ge=1, description="Top-K sampling parameter")
     presence_penalty: Optional[float] = Field(default=None, ge=-2, le=2, description="Presence penalty")
     frequency_penalty: Optional[float] = Field(default=None, ge=-2, le=2, description="Frequency penalty")
     n: Optional[int] = Field(default=1, ge=1, description="Number of completion choices to generate")

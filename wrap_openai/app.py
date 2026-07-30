@@ -3,7 +3,7 @@ import time
 import uuid
 import threading
 import inspect
-from typing import Callable, AsyncGenerator, Generator, Any, Optional, Union
+from typing import Callable, Generator, Any, Optional, Union
 from fastapi import FastAPI, HTTPException, Depends, Header, Security
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -27,7 +27,7 @@ from .models import (
 app = FastAPI(
     title="Wrap OpenAI API",
     description="Wrap any custom generate function as an OpenAI SDK compatible API service",
-    version="0.2.1",
+    version="0.3.0",
 )
 
 # CORS configuration
@@ -41,19 +41,15 @@ _cors_middleware_added = False
 # API Key authentication
 security = HTTPBearer(auto_error=False)
 
-# Store registered generate functions (supports streaming and non-streaming)
-# First parameter can be either:
-#   - prompt: str (for text-only, backward compatible)
-#   - messages: list[dict] (original messages list, so that the function can process multimodal content if needed)
-_registered_funcs = {
-    'generate': {
-        'func': None,  # Callable[[Union[str, list[dict]], ...], str] | None
-        'default_params': {}  # dict[str, Any]
-    },
-    'stream': {
-        'func': None,  # Callable[[Union[str, list[dict]], ...], Generator[str, None, None]] | None
-        'default_params': {}  # dict[str, Any]
-    }
+# A registered generate function always receives OpenAI messages as its first
+# positional argument. All remaining arguments are passed as keyword arguments.
+_registered_generate = {
+    "func": None,
+    "support_stream": False,
+    "model_id": None,
+    "fixed_kwargs": {},
+    "openai_kwargs": {},
+    "custom_kwargs": {},
 }
 
 # API Key verification switch
@@ -62,22 +58,20 @@ _api_key_required = False
 # API Key management switch (controls whether remote API Key management is allowed)
 _allow_remote_api_key_management = True
 
-# Dynamic parameter list (these parameters can be dynamically overridden by client)
-# Note: 
-#   - OpenAI API officially supports: temperature, max_tokens, top_p, presence_penalty, frequency_penalty, n, stop, seed
-#   - max_new_tokens and top_k are included for compatibility with other frameworks (e.g., HuggingFace Transformers)
-_DYNAMIC_PARAMS = {
-    'temperature',       # OpenAI API supported
-    'max_tokens',        # OpenAI API supported
-    'max_new_tokens',    # Compatible with Hugging Face (mapped to max_tokens in requests)
-    'top_p',             # OpenAI API supported
-    'top_k',             # Extended support (some frameworks use this instead of top_p)
-    'presence_penalty',  # OpenAI API supported
-    'frequency_penalty', # OpenAI API supported
-    'n',                 # OpenAI API supported
-    'stop',              # OpenAI API supported
-    'seed'               # OpenAI API supported
+# OpenAI request fields that can be explicitly enabled through openai_kwargs.
+_OPENAI_GENERATION_KWARGS = {
+    "temperature",
+    "max_tokens",
+    "top_p",
+    "presence_penalty",
+    "frequency_penalty",
+    "n",
+    "stop",
+    "seed",
 }
+
+_RESERVED_GENERATE_KWARGS = {"messages", "model_id", "stream"}
+_RESERVED_CUSTOM_KWARGS = _RESERVED_GENERATE_KWARGS | {"model"}
 
 
 def set_allow_remote_api_key_management(allow: bool):
@@ -196,333 +190,191 @@ async def verify_api_key(
     return api_key
 
 
-def _register_func_internal(func_type: str, func: Callable, **kwargs):
-    """
-    Internal unified registration function for both generate and stream functions
-    
-    Args:
-        func_type: 'generate' or 'stream'
-        func: Function to register
-        **kwargs: Additional parameters
-    """
-    global _registered_funcs
-    
-    if kwargs:
-        # Separate fixed and dynamic parameters
-        from functools import partial
-        fixed_params = {}
-        dynamic_params = {}
-        
-        for key, value in kwargs.items():
-            if key in _DYNAMIC_PARAMS:
-                # Dynamic parameter, save as server default
-                dynamic_params[key] = value
-            else:
-                # Fixed parameter (e.g., model, tokenizer), bind using partial
-                fixed_params[key] = value
-        
-        # Save dynamic parameters as server defaults
-        _registered_funcs[func_type]['default_params'] = dynamic_params
-        
-        # Only bind fixed parameters
-        if fixed_params:
-            _registered_funcs[func_type]['func'] = partial(func, **fixed_params)
-        else:
-            _registered_funcs[func_type]['func'] = func
-    else:
-        # Direct registration
-        _registered_funcs[func_type]['func'] = func
-        _registered_funcs[func_type]['default_params'] = {}
+def _copy_kwargs(name: str, value: Optional[dict[str, Any]]) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise TypeError(f"{name} must be a dict or None")
+    if any(not isinstance(key, str) or not key for key in value):
+        raise ValueError(f"All keys in {name} must be non-empty strings")
+    return dict(value)
 
 
-def register_funcs(generate_func: Callable, support_stream: bool, **kwargs):
-    """
-    Register generate function
-    
+def _validate_registered_kwargs(
+    generate_func: Callable,
+    fixed_kwargs: dict[str, Any],
+    openai_kwargs: dict[str, Any],
+    custom_kwargs: dict[str, Any],
+) -> None:
+    groups = {
+        "fixed_kwargs": set(fixed_kwargs),
+        "openai_kwargs": set(openai_kwargs),
+        "custom_kwargs": set(custom_kwargs),
+    }
+
+    group_names = list(groups)
+    for index, first_name in enumerate(group_names):
+        for second_name in group_names[index + 1:]:
+            overlap = groups[first_name] & groups[second_name]
+            if overlap:
+                joined = ", ".join(sorted(overlap))
+                raise ValueError(
+                    f"Parameters cannot appear in both {first_name} and {second_name}: {joined}"
+                )
+
+    invalid_openai = set(openai_kwargs) - _OPENAI_GENERATION_KWARGS
+    if invalid_openai:
+        joined = ", ".join(sorted(invalid_openai))
+        raise ValueError(
+            f"Unsupported parameters in openai_kwargs: {joined}. "
+            "Move non-OpenAI parameters to custom_kwargs."
+        )
+
+    misplaced_openai = (set(fixed_kwargs) | set(custom_kwargs)) & _OPENAI_GENERATION_KWARGS
+    if misplaced_openai:
+        joined = ", ".join(sorted(misplaced_openai))
+        raise ValueError(f"OpenAI parameters must be declared in openai_kwargs: {joined}")
+
+    reserved = (set(fixed_kwargs) | set(openai_kwargs)) & _RESERVED_GENERATE_KWARGS
+    reserved |= set(custom_kwargs) & _RESERVED_CUSTOM_KWARGS
+    if reserved:
+        joined = ", ".join(sorted(reserved))
+        raise ValueError(f"Reserved parameters cannot be registered as kwargs: {joined}")
+
+    all_kwargs = {**fixed_kwargs, **openai_kwargs, **custom_kwargs}
+    try:
+        signature = inspect.signature(generate_func)
+        signature.bind(object(), **all_kwargs)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "generate_func must accept messages as its first positional argument "
+            f"and all registered keyword arguments: {exc}"
+        ) from exc
+
+
+def register_generate(
+    generate_func: Callable,
+    *,
+    support_stream: bool,
+    model_id: str,
+    fixed_kwargs: Optional[dict[str, Any]] = None,
+    openai_kwargs: Optional[dict[str, Any]] = None,
+    custom_kwargs: Optional[dict[str, Any]] = None,
+) -> None:
+    """Register a custom generate function as an OpenAI-compatible API.
+
+    The generate function receives the OpenAI messages list as its first
+    positional argument. Registered values are flattened and passed as keyword
+    arguments.
+
     Args:
-        generate_func: Generate function to register
-                      - First parameter: prompt: str (text-only) OR messages: list[dict]
-                      - Return type: str (support_stream=False) OR Generator[str, None, None] (support_stream=True)
-        support_stream: Whether function supports streaming
-                       - False: Returns str, only non-streaming mode (client's stream parameter ignored)
-                       - True: Returns Generator, supports both modes (respects client's stream parameter)
-        **kwargs: The parameters of the generate function
-                 - Fixed params (e.g., model, tokenizer): bound permanently
-                 - Dynamic params (e.g., temperature): server defaults, can be overridden by client
-    
-    Examples:
-        # Non-streaming function (returns str)
-        register_funcs(my_generate, support_stream=False)
-        
-        # Streaming function (returns Generator)
-        register_funcs(my_stream_generate, support_stream=True)
-        
-        # With parameters
-        register_funcs(my_generate, support_stream=False, model=model, tokenizer=tokenizer, temperature=0.7)
+        generate_func: Custom function returning ``str`` when support_stream is
+            False, or an iterable of string chunks when support_stream is True.
+        support_stream: Whether generate_func returns streaming text chunks.
+        model_id: Model identifier exposed through the OpenAI-compatible API.
+        fixed_kwargs: Server-only values that clients cannot override.
+        openai_kwargs: Defaults for enabled OpenAI generation parameters.
+            Clients override them through standard request fields.
+        custom_kwargs: Defaults for custom generation parameters. Clients
+            override them through OpenAI SDK ``extra_body`` fields.
     """
-    if generate_func is None:
-        raise ValueError("generate_func cannot be None")
-    
+    global _registered_generate
+
+    if not callable(generate_func):
+        raise TypeError("generate_func must be callable")
     if not isinstance(support_stream, bool):
-        raise ValueError(f"support_stream must be a boolean, got {type(support_stream).__name__}")
-    
-    if support_stream:
-        # Function returns Generator: supports both streaming and non-streaming modes
-        # Register generator function for streaming mode (client requests stream=True)
-        _register_func_internal('stream', generate_func, **kwargs)
-        
-        # Create wrapper that collects chunks for non-streaming mode (client requests stream=False)
-        registered_stream_func = _registered_funcs['stream']['func']
-        def non_stream_wrapper(*args, **func_kwargs):
-            result = ""
-            for chunk in registered_stream_func(*args, **func_kwargs):
-                result += chunk
-            return result
-        _registered_funcs['generate']['func'] = non_stream_wrapper
-        _registered_funcs['generate']['default_params'] = _registered_funcs['stream']['default_params'].copy()
-    else:
-        # Function returns str: only supports non-streaming mode
-        # Client's stream parameter will be ignored (handled in chat_completions endpoint)
-        _register_func_internal('generate', generate_func, **kwargs)
+        raise TypeError("support_stream must be a bool")
+    if not isinstance(model_id, str) or not model_id.strip():
+        raise ValueError("model_id must be a non-empty string")
 
+    fixed = _copy_kwargs("fixed_kwargs", fixed_kwargs)
+    openai = _copy_kwargs("openai_kwargs", openai_kwargs)
+    custom = _copy_kwargs("custom_kwargs", custom_kwargs)
+    _validate_registered_kwargs(generate_func, fixed, openai, custom)
 
-def _format_messages(messages: list[Message]) -> str:
-    """
-    Format message list into text
-    
-    Supports multimodal content:
-    - If content is a string, use directly
-    - If content is an array, convert multimodal content to text description
-    """
-    formatted = []
-    for msg in messages:
-        role = msg.role
-        content = msg.content
-        
-        # Handle multimodal content
-        if isinstance(content, list):
-            # Multimodal content: convert to text description
-            content_parts = []
-            for item in content:
-                if isinstance(item, dict):
-                    item_type = item.get("type", "")
-                    if item_type == "text":
-                        content_parts.append(item.get("text", ""))
-                    elif item_type == "image_url":
-                        image_url = item.get("image_url", {})
-                        url = image_url.get("url", "") if isinstance(image_url, dict) else str(image_url)
-                        content_parts.append(f"[Image: {url}]")
-                    else:
-                        content_parts.append(f"[{item_type}: {item}]")
-                else:
-                    content_parts.append(str(item))
-            content_text = " ".join(content_parts)
-        else:
-            # String content
-            content_text = str(content)
-        
-        if role == "system":
-            formatted.append(f"System: {content_text}")
-        elif role == "user":
-            formatted.append(f"User: {content_text}")
-        elif role == "assistant":
-            formatted.append(f"Assistant: {content_text}")
-    return "\n".join(formatted)
+    _registered_generate = {
+        "func": generate_func,
+        "support_stream": support_stream,
+        "model_id": model_id,
+        "fixed_kwargs": fixed,
+        "openai_kwargs": openai,
+        "custom_kwargs": custom,
+    }
 
 
 def _convert_messages_to_dict(messages: list[Message]) -> list[dict]:
-    """
-    Convert Message object list to dictionary list (preserves multimodal structure)
-    
-    Returns:
-        Message dictionary list in format [{"role": "...", "content": "..."}, ...]
-    """
-    result = []
-    for msg in messages:
-        msg_dict = {
-            "role": msg.role,
-            "content": msg.content
-        }
-        result.append(msg_dict)
-    return result
+    return [message.model_dump(exclude_none=True) for message in messages]
 
 
-def _get_function_signature(func: Callable) -> dict[str, Any]:
-    """
-    Get function signature information, including parameter names and default values
-    Supports functools.partial bound functions
-    
-    Returns:
-        Dictionary containing parameter information, keys are parameter names, values are default values (if any)
-    """
-    try:
-        # If it's a partial function, get original function signature
-        from functools import partial
-        if isinstance(func, partial):
-            # Get original function
-            original_func = func.func
-            # Get bound parameters
-            bound_args = func.keywords or {}
-            # Get original function signature
-            sig = inspect.signature(original_func)
-            params = {}
-            param_list = list(sig.parameters.items())
-            # Skip first positional parameter (usually prompt)
-            for i, (name, param) in enumerate(param_list):
-                # Skip first positional parameter (usually prompt)
-                if i == 0:
-                    continue
-                # Skip bound parameters
-                if name in bound_args:
-                    continue
-                # Record parameter (regardless of whether it has a default value)
-                params[name] = param.default if param.default != inspect.Parameter.empty else inspect.Parameter.empty
-            return params
-        else:
-            # Regular function
-            sig = inspect.signature(func)
-            params = {}
-            param_list = list(sig.parameters.items())
-            # Skip first positional parameter (usually prompt)
-            for i, (name, param) in enumerate(param_list):
-                # Skip first positional parameter (usually prompt)
-                if i == 0:
-                    continue
-                # Record parameter (regardless of whether it has a default value)
-                params[name] = param.default if param.default != inspect.Parameter.empty else inspect.Parameter.empty
-            return params
-    except Exception:
-        # If unable to get signature, return empty dictionary
-        return {}
+def _resolve_request_kwargs(request: ChatCompletionRequest) -> dict[str, Any]:
+    fixed_kwargs = _registered_generate["fixed_kwargs"]
+    openai_defaults = _registered_generate["openai_kwargs"]
+    custom_defaults = _registered_generate["custom_kwargs"]
+
+    provided_openai = request.model_fields_set & _OPENAI_GENERATION_KWARGS
+    unsupported_openai = provided_openai - set(openai_defaults)
+    if unsupported_openai:
+        joined = ", ".join(sorted(unsupported_openai))
+        raise HTTPException(
+            status_code=422,
+            detail=f"OpenAI parameters not enabled for this generate function: {joined}",
+        )
+
+    effective_openai = dict(openai_defaults)
+    for name in provided_openai:
+        effective_openai[name] = getattr(request, name)
+
+    extra_fields = dict(request.model_extra or {})
+    fixed_conflicts = set(extra_fields) & set(fixed_kwargs)
+    if fixed_conflicts:
+        joined = ", ".join(sorted(fixed_conflicts))
+        raise HTTPException(
+            status_code=422,
+            detail=f"Fixed parameters cannot be overridden by clients: {joined}",
+        )
+
+    unknown_custom = set(extra_fields) - set(custom_defaults)
+    if unknown_custom:
+        joined = ", ".join(sorted(unknown_custom))
+        allowed = ", ".join(sorted(custom_defaults)) or "none"
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown custom parameters: {joined}. Allowed custom parameters: {allowed}",
+        )
+
+    effective_custom = {**custom_defaults, **extra_fields}
+    return {**fixed_kwargs, **effective_openai, **effective_custom}
 
 
-def _call_with_dynamic_params(func: Callable, prompt: str, request: ChatCompletionRequest, 
-                             server_defaults: dict[str, Any] = None) -> Any:
-    """
-    Dynamically call function based on function signature, passing parameters from request
-    
-    Supports two modes:
-    1. If function signature first parameter is `messages`, pass original messages list (supports multimodal)
-    2. If function signature first parameter is `prompt`, pass formatted string (backward compatible)
-    
-    Parameter priority: client request parameters > server default parameters > function default parameters
-    
-    Args:
-        func: Function to call (may be partial function)
-        prompt: Formatted prompt text (for backward compatibility)
-        request: Request object containing all possible parameters
-        server_defaults: Server default parameters (fallback values)
-        
-    Returns:
-        Function call result
-    """
-    if server_defaults is None:
-        server_defaults = {}
-    
-    # Get function signature (including first parameter)
-    from functools import partial
-    if isinstance(func, partial):
-        original_func = func.func
-        sig = inspect.signature(original_func)
-        param_list = list(sig.parameters.items())
-        # Check if first parameter is bound
-        bound_params = func.keywords or {}
-    else:
-        sig = inspect.signature(func)
-        param_list = list(sig.parameters.items())
-        bound_params = {}
-    
-    # Check first parameter (excluding bound ones)
-    first_param_name = None
-    first_param = None
-    for name, param in param_list:
-        if name not in bound_params:
-            first_param_name = name
-            first_param = param
-            break
-    
-    # Determine what to pass as first argument
-    # Priority: parameter name > type annotation > default (prompt)
-    use_messages = False
-    
-    if first_param_name == "messages":
-        # Parameter name is "messages", use messages list
-        use_messages = True
-    elif first_param is not None and first_param.annotation != inspect.Parameter.empty:
-        # Check type annotation if parameter name is not "messages"
-        annotation = first_param.annotation
-        
-        # Handle string annotations (e.g., "list[dict]" from __future__ annotations)
-        if isinstance(annotation, str):
-            if "list" in annotation.lower() and "dict" in annotation.lower():
-                use_messages = True
-        # Handle actual type annotations
-        else:
-            import typing
-            origin = getattr(annotation, '__origin__', None)
-            if origin is list or (hasattr(typing, 'List') and origin is typing.List):
-                # It's a list type, likely messages
-                use_messages = True
-            elif origin is not None and 'list' in str(origin).lower() and 'dict' in str(annotation).lower():
-                # Generic list type (e.g., list[dict])
-                use_messages = True
-    
-    if use_messages:
-        # Function accepts messages parameter, pass original messages list (supports multimodal)
-        first_arg = _convert_messages_to_dict(request.messages)
-    else:
-        # Function accepts prompt parameter, pass formatted string (backward compatible)
-        first_arg = prompt
-    
-    # Get function signature (excluding bound parameters and first parameter)
-    sig_excluding_first = _get_function_signature(func)
-    
-    # Build parameter dictionary
-    kwargs = {}
-    
-    # Check and pass common parameters
-    # Note: max_tokens may be named max_tokens in request, but user function may use max_new_tokens
-    param_mapping = {
-        'temperature': 'temperature',
-        'max_tokens': 'max_tokens',
-        'max_new_tokens': 'max_tokens',  # Compatible with max_new_tokens parameter name
-        'top_p': 'top_p',
-        'top_k': 'top_k',
-        'presence_penalty': 'presence_penalty',
-        'frequency_penalty': 'frequency_penalty',
-        'n': 'n',
-        'stop': 'stop',
-        'seed': 'seed',
-    }
-    
-    # Get parameter values from request
-    request_params = {
-        'temperature': request.temperature,
-        'max_tokens': request.max_tokens,
-        'top_p': getattr(request, 'top_p', None),
-        'top_k': getattr(request, 'top_k', None),
-        'presence_penalty': getattr(request, 'presence_penalty', None),
-        'frequency_penalty': getattr(request, 'frequency_penalty', None),
-        'n': getattr(request, 'n', None),
-        'stop': getattr(request, 'stop', None),
-        'seed': getattr(request, 'seed', None),
-    }
-    
-    # Check function signature, if function accepts a parameter, pass it
-    # Priority: client parameters > server default parameters
-    for func_param_name, request_param_name in param_mapping.items():
-        if func_param_name in sig_excluding_first:
-            # Prefer client-provided parameters
-            client_value = request_params.get(request_param_name)
-            if client_value is not None:
-                kwargs[func_param_name] = client_value
-            # If client didn't provide, use server default
-            elif func_param_name in server_defaults:
-                kwargs[func_param_name] = server_defaults[func_param_name]
-            # If neither, use function's own default (don't pass parameter)
-    
-    # Call function (if partial function, parameters will be merged automatically)
-    return func(first_arg, **kwargs)
+def _call_registered_generate(request: ChatCompletionRequest) -> Any:
+    messages = _convert_messages_to_dict(request.messages)
+    kwargs = _resolve_request_kwargs(request)
+    return _registered_generate["func"](messages, **kwargs)
+
+
+def _iter_text_chunks(result: Any):
+    if isinstance(result, str) or not hasattr(result, "__iter__"):
+        raise TypeError(
+            "support_stream=True requires generate_func to return an iterable of strings"
+        )
+    for chunk in result:
+        if not isinstance(chunk, str):
+            raise TypeError("Streaming generate_func must yield strings")
+        yield chunk
+
+
+def _estimate_content_tokens(value: Any) -> int:
+    if isinstance(value, str):
+        return len(value.split())
+    if isinstance(value, list):
+        return sum(_estimate_content_tokens(item) for item in value)
+    if isinstance(value, dict):
+        return sum(_estimate_content_tokens(item) for item in value.values())
+    return 0
+
+
+def _estimate_message_tokens(messages: list[dict]) -> int:
+    return sum(_estimate_content_tokens(message.get("content")) for message in messages)
 
 
 async def _async_generator_wrapper(sync_generator: Generator[str, None, None]):
@@ -578,205 +430,145 @@ async def chat_completions(
     request: ChatCompletionRequest,
     api_key: Optional[str] = Depends(verify_api_key)
 ):
-    """
-    OpenAI-compatible chat completion endpoint
-    
-    Supports both streaming and non-streaming modes.
-    
-    Stream mode selection logic:
-    - If support_stream=True: Both generate_func and stream_func are registered (stream_func is the generator, 
-      generate_func is a wrapper that collects chunks). Use client's stream parameter to decide which mode.
-    - If support_stream=False: Only generate_func is registered (returns str). Client's stream parameter is ignored,
-      always use non-streaming mode.
-    """
-    # Check which functions are available
-    has_generate = _registered_funcs['generate']['func'] is not None
-    has_stream = _registered_funcs['stream']['func'] is not None
-    
-    # Determine which mode to use
-    client_requested_stream = bool(request.stream)
-    
-    if has_generate and has_stream:
-        # Both available (support_stream=True): use client's stream parameter to decide
-        use_stream = client_requested_stream
-    elif has_stream:
-        # Only streaming available: use streaming mode (ignore client's stream parameter)
-        use_stream = True
-    elif has_generate:
-        # Only non-streaming available (support_stream=False)
-        # If client requests streaming, return streaming response with complete content in one chunk
-        # Otherwise, return non-streaming response
-        use_stream = client_requested_stream
-    else:
-        # Neither available: error
+    """OpenAI-compatible chat completion endpoint."""
+    if _registered_generate["func"] is None:
         raise HTTPException(
             status_code=500,
-            detail="No generate function registered. Please call register_funcs(generate_func, ...) first"
+            detail="No generate function registered. Call register_generate(...) first.",
         )
-    
-    if use_stream:
-        # Streaming endpoint
-        
+
+    registered_model_id = _registered_generate["model_id"]
+    if request.model != registered_model_id:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Model '{request.model}' is not registered. Available model: {registered_model_id}",
+        )
+
+    if request.stream:
         async def generate_stream():
-            """Async generator"""
-            prompt = _format_messages(request.messages)
             chunk_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
             created = int(time.time())
-            model_name = request.model or "custom-model"  # Use default if model not provided
-            
+
             try:
-                # Check if server only supports non-streaming but client requested streaming
-                if not has_stream and has_generate:
-                    # Server only supports non-streaming, but client requested streaming
-                    # Generate complete response first, then yield as single chunk
-                    response_text = _call_with_dynamic_params(
-                        _registered_funcs['generate']['func'], prompt, request, _registered_funcs['generate']['default_params']
-                    )
-                    
-                    # Send warning chunk first
+                result = _call_registered_generate(request)
+
+                if _registered_generate["support_stream"]:
+                    chunks = _iter_text_chunks(result)
+                    async for chunk_text in _async_generator_wrapper(chunks):
+                        if not chunk_text:
+                            continue
+                        chunk = ChatCompletionChunk(
+                            id=chunk_id,
+                            created=created,
+                            model=registered_model_id,
+                            choices=[
+                                ChatCompletionChunkChoice(
+                                    index=0,
+                                    delta=ChatCompletionChunkDelta(content=chunk_text),
+                                    finish_reason=None,
+                                )
+                            ],
+                        )
+                        yield f"data: {chunk.model_dump_json()}\n\n"
+                else:
+                    if not isinstance(result, str):
+                        raise TypeError(
+                            "support_stream=False requires generate_func to return a string"
+                        )
+
                     warning_chunk = ChatCompletionChunk(
                         id=chunk_id,
                         created=created,
-                        model=model_name,
+                        model=registered_model_id,
                         choices=[
                             ChatCompletionChunkChoice(
                                 index=0,
                                 delta=ChatCompletionChunkDelta(
                                     content="[Warning: Server does not support streaming. Returning complete response in one chunk.]\n\n"
                                 ),
-                                finish_reason=None
+                                finish_reason=None,
                             )
-                        ]
+                        ],
                     )
                     yield f"data: {warning_chunk.model_dump_json()}\n\n"
-                    
-                    # Yield complete content as single chunk
-                    if response_text:
+
+                    if result:
                         content_chunk = ChatCompletionChunk(
                             id=chunk_id,
                             created=created,
-                            model=model_name,
+                            model=registered_model_id,
                             choices=[
                                 ChatCompletionChunkChoice(
                                     index=0,
-                                    delta=ChatCompletionChunkDelta(content=response_text),
-                                    finish_reason=None
+                                    delta=ChatCompletionChunkDelta(content=result),
+                                    finish_reason=None,
                                 )
-                            ]
+                            ],
                         )
                         yield f"data: {content_chunk.model_dump_json()}\n\n"
-                    
-                    # Send completion marker
-                    final_chunk = ChatCompletionChunk(
-                        id=chunk_id,
-                        created=created,
-                        model=model_name,
-                        choices=[
-                            ChatCompletionChunkChoice(
-                                index=0,
-                                delta=ChatCompletionChunkDelta(),
-                                finish_reason="stop"
-                            )
-                        ]
-                    )
-                    yield f"data: {final_chunk.model_dump_json()}\n\n"
-                    yield "data: [DONE]\n\n"
-                else:
-                    # Normal streaming: server supports streaming
-                    # Call synchronous generator, passing dynamic parameters (using streaming function server defaults)
-                    sync_generator = _call_with_dynamic_params(
-                        _registered_funcs['stream']['func'], prompt, request, _registered_funcs['stream']['default_params']
-                    )
-                    
-                    # Convert synchronous generator to async generator to avoid blocking event loop
-                    async for chunk_text in _async_generator_wrapper(sync_generator):
-                        if chunk_text:
-                            chunk = ChatCompletionChunk(
-                                id=chunk_id,
-                                created=created,
-                                model=model_name,
-                                choices=[
-                                    ChatCompletionChunkChoice(
-                                        index=0,
-                                        delta=ChatCompletionChunkDelta(content=chunk_text),
-                                        finish_reason=None
-                                    )
-                                ]
-                            )
-                            yield f"data: {chunk.model_dump_json()}\n\n"
-                    
-                    # Send completion marker
-                    final_chunk = ChatCompletionChunk(
-                        id=chunk_id,
-                        created=created,
-                        model=model_name,
-                        choices=[
-                            ChatCompletionChunkChoice(
-                                index=0,
-                                delta=ChatCompletionChunkDelta(),
-                                finish_reason="stop"
-                            )
-                        ]
-                    )
-                    yield f"data: {final_chunk.model_dump_json()}\n\n"
-                    yield "data: [DONE]\n\n"
+
+                final_chunk = ChatCompletionChunk(
+                    id=chunk_id,
+                    created=created,
+                    model=registered_model_id,
+                    choices=[
+                        ChatCompletionChunkChoice(
+                            index=0,
+                            delta=ChatCompletionChunkDelta(),
+                            finish_reason="stop",
+                        )
+                    ],
+                )
+                yield f"data: {final_chunk.model_dump_json()}\n\n"
+                yield "data: [DONE]\n\n"
+            except HTTPException:
+                raise
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Error during generation: {str(e)}")
-        
+
         return StreamingResponse(
-            generate_stream(), 
+            generate_stream(),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",  # Disable nginx buffering
-            }
+                "X-Accel-Buffering": "no",
+            },
         )
-    else:
-        # Non-streaming endpoint (client requested non-streaming)
-        
-        prompt = _format_messages(request.messages)
-        model_name = request.model or "custom-model"  # Use default if model not provided
-        
-        try:
-            if has_stream and not client_requested_stream:
-                # Server supports streaming but client requested non-streaming
-                # Collect all chunks from streaming function and return complete response
-                sync_generator = _call_with_dynamic_params(
-                    _registered_funcs['stream']['func'], prompt, request, _registered_funcs['stream']['default_params']
+
+    try:
+        result = _call_registered_generate(request)
+        if _registered_generate["support_stream"]:
+            response_text = "".join(_iter_text_chunks(result))
+        else:
+            if not isinstance(result, str):
+                raise TypeError("support_stream=False requires generate_func to return a string")
+            response_text = result
+
+        messages = _convert_messages_to_dict(request.messages)
+        prompt_tokens = _estimate_message_tokens(messages)
+        completion_tokens = len(response_text.split())
+        return ChatCompletionResponse(
+            id=f"chatcmpl-{uuid.uuid4().hex[:8]}",
+            created=int(time.time()),
+            model=registered_model_id,
+            choices=[
+                Choice(
+                    index=0,
+                    message=Message(role="assistant", content=response_text),
+                    finish_reason="stop",
                 )
-                response_text = ""
-                for chunk_text in sync_generator:
-                    response_text += chunk_text
-            else:
-                # Server only supports non-streaming, or both available and client requested non-streaming
-                # Call generate function, passing dynamic parameters (using non-streaming function server defaults)
-                response_text = _call_with_dynamic_params(
-                    _registered_funcs['generate']['func'], prompt, request, _registered_funcs['generate']['default_params']
-                )
-            
-            # Build response
-            response = ChatCompletionResponse(
-                id=f"chatcmpl-{uuid.uuid4().hex[:8]}",
-                created=int(time.time()),
-                model=model_name,
-                choices=[
-                    Choice(
-                        index=0,
-                        message=Message(role="assistant", content=response_text),
-                        finish_reason="stop"
-                    )
-                ],
-                usage=Usage(
-                    prompt_tokens=len(prompt.split()),
-                    completion_tokens=len(response_text.split()),
-                    total_tokens=len(prompt.split()) + len(response_text.split())
-                )
-            )
-            
-            return response
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error during generation: {str(e)}")
+            ],
+            usage=Usage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
+            ),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error during generation: {str(e)}")
 
 
 @app.get("/health")
@@ -784,8 +576,9 @@ async def health():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "generate_func_registered": _registered_funcs['generate']['func'] is not None,
-        "stream_generate_func_registered": _registered_funcs['stream']['func'] is not None,
+        "generate_registered": _registered_generate["func"] is not None,
+        "model_id": _registered_generate["model_id"],
+        "support_stream": _registered_generate["support_stream"],
         "api_key_required": _api_key_required,
         "allow_remote_api_key_management": _allow_remote_api_key_management,
     }
@@ -796,7 +589,7 @@ async def root():
     """Root endpoint"""
     return {
         "message": "Wrap OpenAI API Service",
-        "version": "0.2.1",
+        "version": "0.3.0",
         "endpoints": {
             "chat_completions": "/v1/chat/completions",
             "health": "/health",
@@ -947,16 +740,14 @@ def run_server(
     else:
         print("⚠️  CORS disabled")
     
-    # Check streaming support
-    has_generate = _registered_funcs['generate']['func'] is not None
-    has_stream = _registered_funcs['stream']['func'] is not None
-    
-    if has_stream:
-        print("✅  Streaming mode supported")
-    elif has_generate:
-        print("⚠️  Streaming mode not supported (only non-streaming mode available)")
-    else:
+    if _registered_generate["func"] is None:
         print("❌  No generate function registered!")
+    elif _registered_generate["support_stream"]:
+        print("✅  Streaming mode supported")
+        print(f"✅  Registered model: {_registered_generate['model_id']}")
+    else:
+        print("⚠️  Streaming mode not supported (only non-streaming mode available)")
+        print(f"✅  Registered model: {_registered_generate['model_id']}")
     
     uvicorn.run(app, host=host, port=port)
 

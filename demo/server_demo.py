@@ -1,5 +1,5 @@
 from typing import Generator, Optional, List, Dict, Union
-from wrap_openai import register_funcs, run_server
+from wrap_openai import register_generate, run_server
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
 import threading
 
@@ -76,8 +76,7 @@ def stream_generate(
     messages: List[Dict],
     model,
     tokenizer,
-    max_new_tokens: int = 512,
-    max_tokens: Optional[int] = None,
+    max_tokens: int = 512,
     temperature: float = 0.7,
     top_p: Optional[float] = None,
     top_k: Optional[int] = None,
@@ -125,7 +124,7 @@ def stream_generate(
     
     try:
         text = tokenizer.apply_chat_template(tokenizer_messages, tokenize=False, add_generation_prompt=True)
-    except Exception as e:
+    except Exception:
         # Fallback: combine all messages as plain text
         text = "\n".join([
             f"{msg.get('role', 'user')}: {extract_text_from_content(msg.get('content', ''))}"
@@ -133,14 +132,12 @@ def stream_generate(
         ])
     
     model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
-    actual_max_new_tokens = max_tokens if max_tokens is not None else max_new_tokens
-    
     streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
     
     generation_kwargs = {
         "input_ids": model_inputs.input_ids,
         "attention_mask": model_inputs.attention_mask,  # Explicitly pass attention_mask
-        "max_new_tokens": actual_max_new_tokens,
+        "max_new_tokens": max_tokens,
         "do_sample": True,
         "streamer": streamer,
         "temperature": temperature,
@@ -175,13 +172,22 @@ if __name__ == "__main__":
     model, tokenizer = load_model(args.model)
     
     # Register streaming function (supports both streaming and non-streaming modes)
-    register_funcs(
-        stream_generate,
+    register_generate(
+        generate_func=stream_generate,
         support_stream=True,
-        model=model,
-        tokenizer=tokenizer,
-        max_new_tokens=512,
-        temperature=0.7,
+        model_id=args.model,
+        fixed_kwargs={
+            "model": model,
+            "tokenizer": tokenizer,
+        },
+        openai_kwargs={
+            "max_tokens": 512,
+            "temperature": 0.7,
+            "top_p": 0.9,
+        },
+        custom_kwargs={
+            "top_k": 50,
+        },
     )
     
     print("\n" + "=" * 60)

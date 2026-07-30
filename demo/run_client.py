@@ -6,6 +6,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Wrap OpenAI API Client")
     parser.add_argument("--base-url", type=str, default="http://127.0.0.1:8000/v1", help="API service URL")
     parser.add_argument("--api-key", type=str, default="sk-dummy", help="API Key (use actual key if verification is enabled)")
+    parser.add_argument("--model-id", type=str, default="echo-model", help="Registered model ID")
     parser.add_argument("--no-stream", action="store_true", help="Disable streaming mode (default: streaming)")
     
     args = parser.parse_args()
@@ -37,7 +38,7 @@ if __name__ == "__main__":
             # Non-streaming request
             if not use_stream:
                 response = client.chat.completions.create(
-                    model="custom-model",
+                    model=args.model_id,
                     messages=[{"role": "user", "content": user_input}]
                 )
                 print(f"Assistant: {response.choices[0].message.content}\n")
@@ -46,7 +47,7 @@ if __name__ == "__main__":
             else:
                 print("Assistant: ", end="", flush=True)
                 stream = client.chat.completions.create(
-                    model="custom-model",
+                    model=args.model_id,
                     messages=[{"role": "user", "content": user_input}],
                     stream=True
                 )

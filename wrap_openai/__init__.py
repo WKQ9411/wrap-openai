@@ -1,6 +1,6 @@
 from wrap_openai.app import (
     app,
-    register_funcs,
+    register_generate,
     run_server,
     set_api_key_required,
     set_allow_remote_api_key_management,
@@ -28,11 +28,11 @@ from wrap_openai.models import (
     ChatCompletionChunkDelta,
 )
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 __all__ = [
     # main interface
     "app",
-    "register_funcs",
+    "register_generate",
     "run_server",
     "set_api_key_required",
     "set_allow_remote_api_key_management",
