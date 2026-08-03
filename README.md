@@ -9,6 +9,7 @@ Wrap a research-oriented custom generate function as an OpenAI Chat Completions 
 - OpenAI Chat Completions request and response format
 - Streaming and non-streaming generation
 - Raw `messages` input, including structured multimodal content
+- Standard Chat Completions fields are accepted even when the generate function does not use them
 - Explicit fixed, OpenAI, and custom parameter groups
 - Custom client parameters through OpenAI SDK `extra_body`
 - API Key management, CORS, and health check endpoints
@@ -127,7 +128,7 @@ run_server(host="0.0.0.0", port=8000)
 `register_generate` accepts three flat keyword dictionaries:
 
 - `fixed_kwargs`: server-only objects and values. Clients cannot override them.
-- `openai_kwargs`: enabled OpenAI parameters and server defaults. Standard request fields override them.
+- `openai_kwargs`: OpenAI standard parameters that are forwarded to the generate function, with server defaults. Standard request fields override them.
 - `custom_kwargs`: custom parameters and server defaults. `extra_body` fields override them.
 
 All three dictionaries are flattened when calling the function:
@@ -141,16 +142,11 @@ generate_func(
 )
 ```
 
-The following OpenAI parameters can be enabled through `openai_kwargs`:
-
-- `temperature`
-- `max_tokens`
-- `top_p`
-- `presence_penalty`
-- `frequency_penalty`
-- `n`
-- `stop`
-- `seed`
+`wrap-openai` accepts the standard Chat Completions request fields declared by
+the current protocol adapter. Wrapper-owned fields such as `model`, `messages`,
+`stream`, and `stream_options` are handled internally. Any other standard field
+can be registered through `openai_kwargs` when the generate function supports
+it. Standard fields that are not registered are accepted but ignored.
 
 Non-OpenAI parameters such as `top_k` and experimental decoding controls belong in `custom_kwargs`.
 
@@ -187,7 +183,7 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-`extra_body` values are merged into the JSON request body by the OpenAI SDK. Only fields declared in `custom_kwargs` are accepted. Unknown custom fields and attempts to override fixed values return HTTP 422.
+`extra_body` values are merged into the JSON request body by the OpenAI SDK. Only non-standard fields declared in `custom_kwargs` are accepted. Unknown custom fields and attempts to override fixed values return HTTP 422. Unregistered standard OpenAI fields do not produce an error and are not forwarded to the generate function.
 
 The request `model` must match the `model_id` passed to `register_generate`.
 
@@ -215,7 +211,12 @@ register_generate(
 )
 ```
 
-When the client requests `stream=False`, wrap-openai collects the chunks into one response. When a non-streaming function receives a `stream=True` request, the complete result is returned in one SSE chunk with a warning chunk.
+When the client requests `stream=False`, wrap-openai collects the chunks into one response. When a non-streaming function receives a `stream=True` request, the complete result is returned in one standard SSE content chunk.
+
+The protocol adapter handles `stream_options` itself. When the client sends
+`stream_options={"include_usage": true}`, the final event before `[DONE]` is a
+standard usage chunk with an empty `choices` list. Token counts are currently
+estimated from character counts; they are not tokenizer-accurate measurements.
 
 Client example:
 
@@ -267,7 +268,25 @@ from wrap_openai import set_api_keys_path
 set_api_keys_path("/custom/path/to/keys")
 ```
 
-## 9. Examples
+## 9. Protocol Tests
+
+Run the repeatable protocol test suite before publishing:
+
+```bash
+uv run --extra dev pytest
+```
+
+After installing a published build into a clean environment, run the isolated
+smoke test from the repository checkout:
+
+```bash
+python -I tests/published_smoke.py
+```
+
+Python isolated mode prevents the repository root from shadowing the installed
+distribution.
+
+## 10. Examples
 
 - `demo/run_server.py`: lightweight messages, streaming, and custom parameter example
 - `demo/server_demo.py`: Qwen model deployment example
@@ -275,6 +294,6 @@ set_api_keys_path("/custom/path/to/keys")
 - `demo/chat_demo.py`: CLI chat application
 - `demo/manage_api_keys.py`: API Key management over HTTP
 
-## 10. License
+## 11. License
 
 MIT License

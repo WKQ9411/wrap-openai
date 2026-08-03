@@ -20,6 +20,7 @@ from wrap_openai.models import (
     ImageContent,
     ImageURL,
     ChatCompletionRequest,
+    ChatCompletionStreamOptions,
     ChatCompletionResponse,
     ChatCompletionChunk,
     Choice,
@@ -28,7 +29,7 @@ from wrap_openai.models import (
     ChatCompletionChunkDelta,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 __all__ = [
     # main interface
     "app",
@@ -48,6 +49,7 @@ __all__ = [
     "ImageContent",
     "ImageURL",
     "ChatCompletionRequest",
+    "ChatCompletionStreamOptions",
     "ChatCompletionResponse",
     "ChatCompletionChunk",
     "Choice",

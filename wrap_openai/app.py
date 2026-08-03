@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 import uuid
 import threading
@@ -27,7 +28,7 @@ from .models import (
 app = FastAPI(
     title="Wrap OpenAI API",
     description="Wrap any custom generate function as an OpenAI SDK compatible API service",
-    version="0.3.0",
+    version="0.3.1",
 )
 
 # CORS configuration
@@ -58,19 +59,15 @@ _api_key_required = False
 # API Key management switch (controls whether remote API Key management is allowed)
 _allow_remote_api_key_management = True
 
-# OpenAI request fields that can be explicitly enabled through openai_kwargs.
-_OPENAI_GENERATION_KWARGS = {
-    "temperature",
-    "max_tokens",
-    "top_p",
-    "presence_penalty",
-    "frequency_penalty",
-    "n",
-    "stop",
-    "seed",
-}
+# All fields declared by ChatCompletionRequest are accepted as standard OpenAI
+# protocol fields. Wrapper-owned fields affect routing or response formatting;
+# the remaining fields may be registered through openai_kwargs and forwarded to
+# the custom generate function.
+_OPENAI_REQUEST_FIELDS = set(ChatCompletionRequest.model_fields)
+_WRAPPER_HANDLED_OPENAI_KWARGS = {"model", "messages", "stream", "stream_options"}
+_OPENAI_GENERATION_KWARGS = _OPENAI_REQUEST_FIELDS - _WRAPPER_HANDLED_OPENAI_KWARGS
 
-_RESERVED_GENERATE_KWARGS = {"messages", "model_id", "stream"}
+_RESERVED_GENERATE_KWARGS = {"messages", "model_id", "stream", "stream_options"}
 _RESERVED_CUSTOM_KWARGS = _RESERVED_GENERATE_KWARGS | {"model"}
 
 
@@ -273,8 +270,10 @@ def register_generate(
         support_stream: Whether generate_func returns streaming text chunks.
         model_id: Model identifier exposed through the OpenAI-compatible API.
         fixed_kwargs: Server-only values that clients cannot override.
-        openai_kwargs: Defaults for enabled OpenAI generation parameters.
-            Clients override them through standard request fields.
+        openai_kwargs: Defaults for OpenAI standard parameters that should be
+            forwarded to generate_func. Clients override them through standard
+            request fields. Other standard fields are accepted but not
+            forwarded.
         custom_kwargs: Defaults for custom generation parameters. Clients
             override them through OpenAI SDK ``extra_body`` fields.
     """
@@ -311,15 +310,7 @@ def _resolve_request_kwargs(request: ChatCompletionRequest) -> dict[str, Any]:
     openai_defaults = _registered_generate["openai_kwargs"]
     custom_defaults = _registered_generate["custom_kwargs"]
 
-    provided_openai = request.model_fields_set & _OPENAI_GENERATION_KWARGS
-    unsupported_openai = provided_openai - set(openai_defaults)
-    if unsupported_openai:
-        joined = ", ".join(sorted(unsupported_openai))
-        raise HTTPException(
-            status_code=422,
-            detail=f"OpenAI parameters not enabled for this generate function: {joined}",
-        )
-
+    provided_openai = request.model_fields_set & set(openai_defaults)
     effective_openai = dict(openai_defaults)
     for name in provided_openai:
         effective_openai[name] = getattr(request, name)
@@ -346,10 +337,21 @@ def _resolve_request_kwargs(request: ChatCompletionRequest) -> dict[str, Any]:
     return {**fixed_kwargs, **effective_openai, **effective_custom}
 
 
-def _call_registered_generate(request: ChatCompletionRequest) -> Any:
+def _call_registered_generate(request: ChatCompletionRequest) -> tuple[list[dict], Any]:
     messages = _convert_messages_to_dict(request.messages)
     kwargs = _resolve_request_kwargs(request)
-    return _registered_generate["func"](messages, **kwargs)
+    result = _registered_generate["func"](messages, **kwargs)
+    return messages, result
+
+
+def _validate_generate_result(result: Any) -> None:
+    if _registered_generate["support_stream"]:
+        if isinstance(result, str) or not hasattr(result, "__iter__"):
+            raise TypeError(
+                "support_stream=True requires generate_func to return an iterable of strings"
+            )
+    elif not isinstance(result, str):
+        raise TypeError("support_stream=False requires generate_func to return a string")
 
 
 def _iter_text_chunks(result: Any):
@@ -365,7 +367,7 @@ def _iter_text_chunks(result: Any):
 
 def _estimate_content_tokens(value: Any) -> int:
     if isinstance(value, str):
-        return len(value.split())
+        return len(value)
     if isinstance(value, list):
         return sum(_estimate_content_tokens(item) for item in value)
     if isinstance(value, dict):
@@ -375,6 +377,23 @@ def _estimate_content_tokens(value: Any) -> int:
 
 def _estimate_message_tokens(messages: list[dict]) -> int:
     return sum(_estimate_content_tokens(message.get("content")) for message in messages)
+
+
+def _build_usage(messages: list[dict], response_text: str) -> Usage:
+    prompt_tokens = _estimate_message_tokens(messages)
+    completion_tokens = _estimate_content_tokens(response_text)
+    return Usage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=prompt_tokens + completion_tokens,
+    )
+
+
+def _format_sse_chunk(chunk: ChatCompletionChunk, include_usage: bool) -> str:
+    payload = chunk.model_dump(exclude_none=True)
+    if include_usage and chunk.usage is None:
+        payload["usage"] = None
+    return f"data: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
 
 
 async def _async_generator_wrapper(sync_generator: Generator[str, None, None]):
@@ -401,28 +420,25 @@ async def _async_generator_wrapper(sync_generator: Generator[str, None, None]):
     
     # Asynchronously get data from queue
     while True:
+        # Wait for data in queue or generator completion
+        if finished.is_set() and queue.empty():
+            break
+
+        # Use timeout to periodically check if generator is done
         try:
-            # Wait for data in queue or generator completion
-            if finished.is_set() and queue.empty():
+            item = await asyncio.wait_for(queue.get(), timeout=0.1)
+        except asyncio.TimeoutError:
+            if finished.is_set():
                 break
-            
-            # Use timeout to periodically check if generator is done
-            try:
-                item = await asyncio.wait_for(queue.get(), timeout=0.1)
-            except asyncio.TimeoutError:
-                if finished.is_set():
-                    break
-                continue
-            
-            if isinstance(item, dict):
-                if "error" in item:
-                    raise Exception(item["error"])
-                if "done" in item:
-                    break
-            else:
-                yield item
-        except Exception as e:
-            raise
+            continue
+
+        if isinstance(item, dict):
+            if "error" in item:
+                raise RuntimeError(item["error"])
+            if "done" in item:
+                break
+        else:
+            yield item
 
 
 @app.post("/v1/chat/completions")
@@ -444,19 +460,45 @@ async def chat_completions(
             detail=f"Model '{request.model}' is not registered. Available model: {registered_model_id}",
         )
 
+    try:
+        messages, result = _call_registered_generate(request)
+        _validate_generate_result(result)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Error during generation: {str(exc)}")
+
     if request.stream:
+        include_usage = bool(
+            request.stream_options is not None and request.stream_options.include_usage
+        )
+
         async def generate_stream():
             chunk_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
             created = int(time.time())
+            response_parts = []
 
             try:
-                result = _call_registered_generate(request)
+                role_chunk = ChatCompletionChunk(
+                    id=chunk_id,
+                    created=created,
+                    model=registered_model_id,
+                    choices=[
+                        ChatCompletionChunkChoice(
+                            index=0,
+                            delta=ChatCompletionChunkDelta(role="assistant"),
+                            finish_reason=None,
+                        )
+                    ],
+                )
+                yield _format_sse_chunk(role_chunk, include_usage)
 
                 if _registered_generate["support_stream"]:
                     chunks = _iter_text_chunks(result)
                     async for chunk_text in _async_generator_wrapper(chunks):
                         if not chunk_text:
                             continue
+                        response_parts.append(chunk_text)
                         chunk = ChatCompletionChunk(
                             id=chunk_id,
                             created=created,
@@ -469,30 +511,10 @@ async def chat_completions(
                                 )
                             ],
                         )
-                        yield f"data: {chunk.model_dump_json()}\n\n"
+                        yield _format_sse_chunk(chunk, include_usage)
                 else:
-                    if not isinstance(result, str):
-                        raise TypeError(
-                            "support_stream=False requires generate_func to return a string"
-                        )
-
-                    warning_chunk = ChatCompletionChunk(
-                        id=chunk_id,
-                        created=created,
-                        model=registered_model_id,
-                        choices=[
-                            ChatCompletionChunkChoice(
-                                index=0,
-                                delta=ChatCompletionChunkDelta(
-                                    content="[Warning: Server does not support streaming. Returning complete response in one chunk.]\n\n"
-                                ),
-                                finish_reason=None,
-                            )
-                        ],
-                    )
-                    yield f"data: {warning_chunk.model_dump_json()}\n\n"
-
                     if result:
+                        response_parts.append(result)
                         content_chunk = ChatCompletionChunk(
                             id=chunk_id,
                             created=created,
@@ -505,7 +527,7 @@ async def chat_completions(
                                 )
                             ],
                         )
-                        yield f"data: {content_chunk.model_dump_json()}\n\n"
+                        yield _format_sse_chunk(content_chunk, include_usage)
 
                 final_chunk = ChatCompletionChunk(
                     id=chunk_id,
@@ -519,12 +541,21 @@ async def chat_completions(
                         )
                     ],
                 )
-                yield f"data: {final_chunk.model_dump_json()}\n\n"
+                yield _format_sse_chunk(final_chunk, include_usage)
+
+                if include_usage:
+                    usage_chunk = ChatCompletionChunk(
+                        id=chunk_id,
+                        created=created,
+                        model=registered_model_id,
+                        choices=[],
+                        usage=_build_usage(messages, "".join(response_parts)),
+                    )
+                    yield _format_sse_chunk(usage_chunk, include_usage=True)
+
                 yield "data: [DONE]\n\n"
-            except HTTPException:
-                raise
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Error during generation: {str(e)}")
+            except Exception as exc:
+                raise RuntimeError(f"Error during generation: {str(exc)}") from exc
 
         return StreamingResponse(
             generate_stream(),
@@ -537,17 +568,11 @@ async def chat_completions(
         )
 
     try:
-        result = _call_registered_generate(request)
         if _registered_generate["support_stream"]:
             response_text = "".join(_iter_text_chunks(result))
         else:
-            if not isinstance(result, str):
-                raise TypeError("support_stream=False requires generate_func to return a string")
             response_text = result
 
-        messages = _convert_messages_to_dict(request.messages)
-        prompt_tokens = _estimate_message_tokens(messages)
-        completion_tokens = len(response_text.split())
         return ChatCompletionResponse(
             id=f"chatcmpl-{uuid.uuid4().hex[:8]}",
             created=int(time.time()),
@@ -559,11 +584,7 @@ async def chat_completions(
                     finish_reason="stop",
                 )
             ],
-            usage=Usage(
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                total_tokens=prompt_tokens + completion_tokens,
-            ),
+            usage=_build_usage(messages, response_text),
         )
     except HTTPException:
         raise
@@ -589,7 +610,7 @@ async def root():
     """Root endpoint"""
     return {
         "message": "Wrap OpenAI API Service",
-        "version": "0.3.0",
+        "version": "0.3.1",
         "endpoints": {
             "chat_completions": "/v1/chat/completions",
             "health": "/health",
@@ -680,7 +701,7 @@ async def revoke_api_key(api_key: str):
     if api_key_manager.revoke_key(api_key):
         return {
             "success": True,
-            "message": f"API Key revoked"
+            "message": "API Key revoked"
         }
     else:
         raise HTTPException(
